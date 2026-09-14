@@ -129,13 +129,44 @@ async def run_agent(mode: str, poll: int, tokens: str, chains: str):
     if settings.database_url and "postgresql" in settings.database_url:
         db_url = settings.database_url
 
+    # ─── SAFETY GUARD: wallet_address must be the PUBLIC address, NEVER the private key ───
+    # Passing the private key as the wallet address would leak it to the executor /
+    # Jupiter. This guard prevents that class of leak from ever recurring.
+
+    # SECURITY: private keys are ONLY ever read from the environment and used
+    # locally for signing. They are never stored in settings/config, never
+    # printed, and never sent to any API / the blockchain. If unset, live mode
+    # below refuses to start.
+    wallet_address = settings.solana_wallet_address if not is_paper else ""
+    private_key = os.environ.get("SOLANA_PRIVATE_KEY", "") if not is_paper else ""
+    bsc_private_key = os.environ.get("BSC_PRIVATE_KEY", "") if not is_paper else ""
+    if not is_paper:
+        if not wallet_address:
+            raise RuntimeError(
+                "SECURITY: solana_wallet_address is empty in live mode — "
+                "refusing to construct executor without a public wallet address."
+            )
+        if wallet_address == private_key:
+            raise RuntimeError(
+                "SECURITY: wallet_address must be the public address, not the private key. "
+                "Refusing to start to prevent leaking the private key."
+            )
+        # Heuristic: a Solana private key is a long secret (>=64 chars), while a
+        # public address is short base58 (~44 chars). Reject anything that looks like a key.
+        if len(wallet_address) >= 64:
+            raise RuntimeError(
+                "SECURITY: wallet_address appears to be a private key, not a public address. "
+                "Refusing to start."
+            )
+
     agent = QuantAgent(
         config=config,
         dex_collector=collector,
         llm_api_key=settings.openai_api_key,
         birdeye_api_key=settings.birdeye_api_key,
-        wallet_address=settings.solana_private_key_encrypted if not is_paper else "",
-        private_key=settings.solana_private_key_encrypted if not is_paper else "",
+        wallet_address=wallet_address,
+        private_key=private_key,
+        bsc_private_key=bsc_private_key,
         database=Database(db_url),
     )
 
