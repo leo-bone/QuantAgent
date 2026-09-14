@@ -79,6 +79,7 @@ class QuantAgent:
         executors: dict[Chain, ChainExecutor] | None = None,
         wallet_address: str = "",
         private_key: str = "",
+        bsc_private_key: str = "",
         database: Database | None = None,
     ):
         self.config = config
@@ -103,6 +104,7 @@ class QuantAgent:
         # Credentials (only used in live mode, never logged)
         self._wallet_address = wallet_address
         self._private_key = private_key
+        self._bsc_private_key = bsc_private_key
 
         # API keys
         self._birdeye_api_key = birdeye_api_key
@@ -123,6 +125,11 @@ class QuantAgent:
         self._trade_history: list[dict] = []
         self._execution_history: list[ExecutionResult] = []
         self._portfolio_usd: float = 0.0
+        self._cash_usd: float = 0.0
+        # position ledger: (token, chain) -> {"units": float, "cost_usd": float}
+        self._ledger: dict = {}
+        self._last_prices: dict = {}  # (token, chain) -> last seen price
+        self._kill_switch_active: bool = False
         self._running = False
 
     def register_executor(self, chain: Chain, executor: ChainExecutor) -> None:
