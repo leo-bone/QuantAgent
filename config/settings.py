@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     bsc_rpc_url: str = "https://bsc-dataseed.binance.org"
     bsc_wss_url: str = "wss://bsc-ws-node.nariox.org"
     bsc_private_key_encrypted: str = ""
+    bsc_wallet_address: str = ""
     pancakeswap_router: str = "0x10ED43C718714eb63d5aA57B78B54704E256924E"
 
     # AI / LLM
