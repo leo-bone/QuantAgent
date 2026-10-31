@@ -15,7 +15,7 @@ aiosqlite>=0.19.0
 asyncpg>=0.29.0
 
 # API
-fastapi>=0.104.0
+fastapi>=0.162.0
 uvicorn[standard]>=0.24.0
 websockets>=12.0
 
