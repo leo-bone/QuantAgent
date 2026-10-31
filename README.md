@@ -48,6 +48,20 @@ uvicorn quantagent.api.app:app --reload
 - 设置合理的交易限额和止损
 - 本软件不构成投资建议
 
+### ERC-20 授权额度
+
+swap 前需要给 PancakeSwap router 授权（`approve`），**授权额度就是「router 被攻破时最多能划走多少」**。
+默认按单笔交易精确授权，不留残余敞口：
+
+| `BSC_ALLOWANCE_MODE` | 授权量 | 残余敞口 | 适用 |
+|---|---|---|---|
+| `exact`（默认） | 恰好本笔所需 | 0（swap 花光，额度自动归零） | 推荐 |
+| `capped` | `amount × BSC_ALLOWANCE_CAP_MULTIPLE`（默认 2 倍） | 最多多一笔 | 高频交易、想省 approve 的 gas |
+| `unlimited` | `type(uint256).max` | **该代币全部余额** | 明确接受风险才用，启动时打警告 |
+
+`BSC_REVOKE_AFTER_SWAP=true` 可在成交后把残留授权归零（多花一笔 gas）。
+未知模式会直接抛错，不会静默降级。
+
 ## 技术栈
 
 | 组件 | 技术 |

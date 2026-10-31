@@ -121,6 +121,9 @@ async def run_agent(mode: str, poll: int, tokens: str, chains: str):
         rpc_url=settings.bsc_rpc_url,
         paper_mode=is_paper,
         router_address=settings.pancakeswap_router,
+        allowance_mode=settings.bsc_allowance_mode,
+        allowance_cap_multiple=settings.bsc_allowance_cap_multiple,
+        revoke_after_swap=settings.bsc_revoke_after_swap,
     )
 
     # Build agent with all components

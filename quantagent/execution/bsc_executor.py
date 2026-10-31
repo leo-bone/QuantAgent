@@ -25,6 +25,42 @@ BSC_TOKEN_ADDRESSES = {
 # PancakeSwap V2 Router
 PANCAKE_ROUTER_V2 = "0x10ED43C718714eb63d5aA57B78B54704E256924E"
 
+# ─── ERC-20 授权策略 ────────────────────────────────────────────────────────
+# 授权额度决定了「一旦 router 合约被攻破/被替换，钱包里该代币最多能被划走多少」。
+# 因此默认按单笔交易精确授权，而不是业界常见的 type(uint256).max。
+ALLOWANCE_MODES = ("exact", "capped", "unlimited")
+MAX_UINT256 = 2**256 - 1
+
+
+def resolve_approval_amount(
+    amount_wei: int,
+    mode: str = "exact",
+    cap_multiple: float = 2.0,
+) -> int:
+    """计算本次 approve 应该授权的数量（wei）。
+
+    - exact     ：只授权本笔交易需要的量。swap 会把它刚好花完，残留归零，
+                  无需额外的 revoke 交易，风险敞口 = 0。
+    - capped    ：授权 amount * cap_multiple（至少 1 倍），减少 approve 次数省 gas，
+                  但残余敞口最多多出「一笔交易」的量。
+    - unlimited ：type(uint256).max。仅在你明确接受风险时启用。
+
+    未知模式直接抛错（fail-closed），绝不默默降级。
+    """
+    if not isinstance(amount_wei, int) or isinstance(amount_wei, bool) or amount_wei <= 0:
+        raise ValueError(f"授权数量必须是正整数（wei），收到 {amount_wei!r}")
+    if mode == "exact":
+        return amount_wei
+    if mode == "capped":
+        if cap_multiple < 1.0:
+            raise ValueError(f"cap_multiple 必须 >= 1.0，收到 {cap_multiple!r}")
+        return max(amount_wei, int(amount_wei * cap_multiple))
+    if mode == "unlimited":
+        return MAX_UINT256
+    raise ValueError(
+        f"未知的授权模式 {mode!r}，可选：{', '.join(ALLOWANCE_MODES)}"
+    )
+
 # Minimal ABI for swaps + gas estimation
 ROUTER_ABI = [
     {
@@ -121,12 +157,13 @@ class BSCExecutor(ChainExecutor):
 
     Flow (live mode):
     1. getAmountsOut → expected output
-    2. Check & approve token allowance if needed
+    2. Check allowance; approve **only what this trade needs** (see ALLOWANCE_MODES)
     3. Build swapExactTokensForTokens (or ETH variant) tx
     4. Estimate gas
     5. Sign with private key
     6. Send via eth.send_raw_transaction
     7. Wait for receipt
+    8. Optionally revoke the residual allowance (revoke_after_swap)
 
     Paper mode:
     - Steps 1 only (quote), no state changes
@@ -138,11 +175,31 @@ class BSCExecutor(ChainExecutor):
         paper_mode: bool = True,
         router_address: str = PANCAKE_ROUTER_V2,
         gas_price_multiplier: float = 1.1,
+        allowance_mode: str = "exact",
+        allowance_cap_multiple: float = 2.0,
+        revoke_after_swap: bool = False,
     ):
         super().__init__(paper_mode=paper_mode)
+        if allowance_mode not in ALLOWANCE_MODES:
+            raise ValueError(
+                f"未知的授权模式 {allowance_mode!r}，可选：{', '.join(ALLOWANCE_MODES)}"
+            )
+        if allowance_mode == "capped" and allowance_cap_multiple < 1.0:
+            raise ValueError(
+                f"allowance_cap_multiple 必须 >= 1.0，收到 {allowance_cap_multiple!r}"
+            )
         self.rpc_url = rpc_url
         self.router_address = router_address
         self.gas_price_multiplier = gas_price_multiplier
+        self.allowance_mode = allowance_mode
+        self.allowance_cap_multiple = allowance_cap_multiple
+        self.revoke_after_swap = revoke_after_swap
+        if allowance_mode == "unlimited":
+            logger.warning(
+                "BSC 执行器启用了无限授权（approve type(uint256).max）："
+                "若 router 合约存在漏洞或被替换，钱包内该代币可被一次性全部转出。"
+                "建议改用 allowance_mode='exact'（默认）。"
+            )
         self._w3 = None
 
     def _get_w3(self):
@@ -211,6 +268,40 @@ class BSCExecutor(ChainExecutor):
         # Route through WBNB for better liquidity
         return [from_addr, wbnb, to_addr]
 
+    async def _submit_approve(
+        self,
+        erc20,
+        owner: str,
+        spender: str,
+        amount_wei: int,
+        private_key: str,
+        token: str,
+    ) -> bool:
+        """构造、签名并发送一笔 approve 交易，等待回执。"""
+        from web3 import Web3
+
+        w3 = self._get_w3()
+        nonce = w3.eth.get_transaction_count(Web3.to_checksum_address(owner))
+        gas_price = w3.eth.gas_price
+        tx = erc20.functions.approve(spender, amount_wei).build_transaction({
+            "from": Web3.to_checksum_address(owner),
+            "nonce": nonce,
+            "gasPrice": int(gas_price * self.gas_price_multiplier),
+            "gas": 60_000,
+        })
+
+        signed = w3.eth.account.sign_transaction(tx, private_key)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+
+        receipt = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        )
+        if receipt["status"] == 1:
+            logger.info(f"Approval confirmed: {token} -> {tx_hash.hex()}")
+            return True
+        logger.error(f"Approval failed: {token}")
+        return False
+
     async def _ensure_approval(
         self,
         token: str,
@@ -218,7 +309,10 @@ class BSCExecutor(ChainExecutor):
         amount: float,
         private_key: str,
     ) -> bool:
-        """Approve router to spend tokens if allowance insufficient."""
+        """确保 router 有足够额度完成本笔交易。
+
+        授权量由 self.allowance_mode 决定，默认 exact（只授权本笔所需）。
+        """
         from web3 import Web3
 
         token_addr = self._get_addr(token)
@@ -234,31 +328,42 @@ class BSCExecutor(ChainExecutor):
         if allowance >= amount_wei:
             return True  # Already approved
 
-        logger.info(f"Approving {token} for PancakeSwap router...")
-        # Max approval (type(uint256).max)
-        max_approval = 2**256 - 1
-
-        nonce = w3.eth.get_transaction_count(Web3.to_checksum_address(owner))
-        gas_price = w3.eth.gas_price
-        tx = erc20.functions.approve(router_addr, max_approval).build_transaction({
-            "from": Web3.to_checksum_address(owner),
-            "nonce": nonce,
-            "gasPrice": int(gas_price * self.gas_price_multiplier),
-            "gas": 60_000,
-        })
-
-        signed = w3.eth.account.sign_transaction(tx, private_key)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-
-        receipt = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        approve_amount = resolve_approval_amount(
+            amount_wei, self.allowance_mode, self.allowance_cap_multiple
         )
-        if receipt["status"] == 1:
-            logger.info(f"Approval confirmed: {tx_hash.hex()}")
-            return True
+
+        if self.allowance_mode == "unlimited":
+            logger.warning(
+                f"向 PancakeSwap router 授予 {token} 的无限额度（type(uint256).max）"
+                "——该代币的全部余额从此对该合约可见可动。"
+            )
         else:
-            logger.error(f"Approval failed")
-            return False
+            logger.info(
+                f"Approving {token} for PancakeSwap router: "
+                f"{self._from_wei(token, approve_amount):.8f} {token} "
+                f"(mode={self.allowance_mode}, needed={amount:.8f})"
+            )
+
+        return await self._submit_approve(
+            erc20, owner, router_addr, approve_amount, private_key, token
+        )
+
+    async def revoke_allowance(
+        self,
+        token: str,
+        owner: str,
+        private_key: str,
+    ) -> bool:
+        """把对该 token 的 router 授权归零（approve 0）。"""
+        from web3 import Web3
+
+        token_addr = self._get_addr(token)
+        erc20 = self._get_erc20(token_addr)
+        router_addr = Web3.to_checksum_address(self.router_address)
+        logger.info(f"Revoking {token} allowance for PancakeSwap router...")
+        return await self._submit_approve(
+            erc20, owner, router_addr, 0, private_key, token
+        )
 
     async def execute_swap(
         self,
@@ -420,6 +525,12 @@ class BSCExecutor(ChainExecutor):
                 result.status = ExecutionStatus.SUCCESS
                 # Parse actual output from logs if needed
                 logger.info(f"[LIVE/BSC] Confirmed in block {receipt['blockNumber']}")
+                # 可选：成交后把残留授权归零（exact 模式下 swap 已花光额度，通常无需）
+                if self.revoke_after_swap and from_token != "BNB":
+                    try:
+                        await self.revoke_allowance(from_token, owner, private_key)
+                    except Exception as revoke_err:
+                        logger.warning(f"撤销授权失败（不影响本笔成交）: {revoke_err}")
             else:
                 result.status = ExecutionStatus.FAILED
                 result.error = "Transaction reverted on-chain"

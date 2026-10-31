@@ -36,6 +36,14 @@ class Settings(BaseSettings):
     bsc_wallet_address: str = ""
     pancakeswap_router: str = "0x10ED43C718714eb63d5aA57B78B54704E256924E"
 
+    # BSC 授权策略（决定 router 被攻破时最多能划走多少）
+    #   exact     —— 只授权本笔交易所需量，成交后额度自然归零（默认，最安全）
+    #   capped    —— 授权 amount × cap_multiple，省 approve 的 gas，残余敞口最多一笔
+    #   unlimited —— type(uint256).max，需明确接受「代币可被一次性全部划走」的风险
+    bsc_allowance_mode: str = "exact"
+    bsc_allowance_cap_multiple: float = 2.0
+    bsc_revoke_after_swap: bool = False
+
     # AI / LLM
     openai_api_key: str = ""
     anthropic_api_key: str = ""
